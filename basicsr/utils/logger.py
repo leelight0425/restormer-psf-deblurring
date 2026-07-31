@@ -68,8 +68,8 @@ class MessageLogger():
         # other items, especially losses
         for k, v in log_vars.items():
             message += f'{k}: {v:.4e} '
-            # tensorboard logger
-            if self.use_tb_logger and 'debug' not in self.exp_name:
+            # tensorboard logger (only rank 0 has non-None tb_logger)
+            if self.use_tb_logger and self.tb_logger is not None and 'debug' not in self.exp_name:
                 if k.startswith('l_'):
                     self.tb_logger.add_scalar(f'losses/{k}', v, current_iter)
                 else:

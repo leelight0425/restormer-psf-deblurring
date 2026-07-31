@@ -23,7 +23,7 @@ import numpy as np
 def parse_options(is_train=True):
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        '-opt', type=str, required=True, help='Path to option YAML file.')
+        '-opt', type=str, default="PSF_Deblurring/Options/PSFDeblurring_Enc_Restormer.yml", help='Path to option YAML file.')
     parser.add_argument(
         '--launcher',
         choices=['none', 'pytorch', 'slurm'],
@@ -73,8 +73,10 @@ def init_loggers(opt):
             'should turn on tensorboard when using wandb')
         init_wandb_logger(opt)
     tb_logger = None
-    if opt['logger'].get('use_tb_logger') and 'debug' not in opt['name']:
-        tb_logger = init_tb_logger(log_dir=osp.join('tb_logger', opt['name']))
+    if opt['logger'].get('use_tb_logger') and 'debug' not in opt['name'] and opt['rank'] == 0:
+        tb_dir = osp.abspath(osp.join('tb_logger', opt['name']))
+        tb_logger = init_tb_logger(log_dir=tb_dir)
+        logger.info(f'TensorBoard log dir: {tb_dir}')
     return logger, tb_logger
 
 
@@ -134,19 +136,25 @@ def main():
     torch.backends.cudnn.benchmark = True
     # torch.backends.cudnn.deterministic = True
 
-    # automatic resume ..
-    state_folder_path = 'experiments/{}/training_states/'.format(opt['name'])
+    # automatic resume — use configured experiments_root
+    state_folder_path = opt['path']['training_states']
     import os
-    try:
-        states = os.listdir(state_folder_path)
-    except:
-        states = []
 
     resume_state = None
-    if len(states) > 0:
-        max_state_file = '{}.state'.format(max([int(x[0:-6]) for x in states]))
-        resume_state = os.path.join(state_folder_path, max_state_file)
-        opt['path']['resume_state'] = resume_state
+    if os.path.isdir(state_folder_path):
+        try:
+            state_files = [f for f in os.listdir(state_folder_path) if f.endswith('.state')]
+            if state_files:
+                # pick the one with the largest iteration number
+                max_iter = max(int(f[:-6]) for f in state_files)
+                max_state_file = f'{max_iter}.state'
+                resume_state = os.path.join(state_folder_path, max_state_file)
+                opt['path']['resume_state'] = resume_state
+        except Exception as e:
+            print(f'[AutoResume] Failed to scan {state_folder_path}: {e}', flush=True)
+
+    if opt['path'].get('resume_state'):
+        print(f'[AutoResume] Found resume state: {opt["path"]["resume_state"]}', flush=True)
 
     # load resume states if necessary
     if opt['path'].get('resume_state'):
@@ -207,6 +215,10 @@ def main():
     data_time, iter_time = time.time(), time.time()
     start_time = time.time()
 
+    # best model tracking
+    best_metric = 0.0
+    best_iter = 0
+
     # for epoch in range(start_epoch, total_epochs + 1):
 
     iters = opt['datasets']['train'].get('iters')
@@ -249,16 +261,19 @@ def main():
             mini_batch_size = mini_batch_sizes[bs_j]
             
             if logger_j[bs_j]:
-                logger.info('\n Updating Patch_Size to {} and Batch_Size to {} \n'.format(mini_gt_size, mini_batch_size*torch.cuda.device_count())) 
+                logger.info('\n Updating Patch_Size to {} and Batch_Size to {} \n'.format(mini_gt_size, mini_batch_size * opt['world_size']))
                 logger_j[bs_j] = False
 
             lq = train_data['lq']
             gt = train_data['gt']
+            psf_kernel = train_data.get('psf_kernel')  # may be None for non-PSF datasets
 
             if mini_batch_size < batch_size:
                 indices = random.sample(range(0, batch_size), k=mini_batch_size)
                 lq = lq[indices]
                 gt = gt[indices]
+                if psf_kernel is not None:
+                    psf_kernel = psf_kernel[indices]
 
             if mini_gt_size < gt_size:
                 x0 = int((gt_size - mini_gt_size) * random.random())
@@ -270,7 +285,8 @@ def main():
             ###-------------------------------------------
 
             
-            model.feed_train_data({'lq': lq, 'gt':gt})
+            model.feed_train_data({'lq': lq, 'gt':gt,
+                                  'psf_kernel': psf_kernel})
             model.optimize_parameters(current_iter)
 
             iter_time = time.time() - iter_time
@@ -293,8 +309,16 @@ def main():
                 rgb2bgr = opt['val'].get('rgb2bgr', True)
                 # wheather use uint8 image to compute metrics
                 use_image = opt['val'].get('use_image', True)
-                model.validation(val_loader, current_iter, tb_logger,
-                                 opt['val']['save_img'], rgb2bgr, use_image )
+                current_metric = model.validation(val_loader, current_iter, tb_logger,
+                                 opt['val']['save_img'], rgb2bgr, use_image)
+
+                # track best model (higher metric = better, e.g. PSNR)
+                if current_metric > best_metric:
+                    best_metric = current_metric
+                    best_iter = current_iter
+                    logger.info(f'New best model! iter={current_iter}, '
+                                f'metric={best_metric:.4f}')
+                    model.save(epoch, current_iter, suffix='best')
 
             data_time = time.time()
             iter_time = time.time()
@@ -307,6 +331,8 @@ def main():
     consumed_time = str(
         datetime.timedelta(seconds=int(time.time() - start_time)))
     logger.info(f'End of training. Time consumed: {consumed_time}')
+    if best_iter > 0:
+        logger.info(f'Best model at iter={best_iter}, metric={best_metric:.4f}')
     logger.info('Save the latest model.')
     model.save(epoch=-1, current_iter=-1)  # -1 stands for the latest
     if opt.get('val') is not None:

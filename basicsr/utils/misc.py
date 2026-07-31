@@ -31,7 +31,10 @@ def mkdir_and_rename(path):
     if osp.exists(path):
         new_name = path + '_archived_' + get_time_str()
         print(f'Path already exists. Rename it to {new_name}', flush=True)
-        os.rename(path, new_name)
+        try:
+            os.rename(path, new_name)
+        except OSError as e:
+            print(f'  Rename failed ({e}), will overwrite files in {path}', flush=True)
     os.makedirs(path, exist_ok=True)
 
 

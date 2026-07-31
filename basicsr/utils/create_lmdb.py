@@ -81,6 +81,29 @@ def create_lmdb_for_rain13k():
     img_path_list, keys = prepare_keys(folder_path, 'jpg')
     make_lmdb_from_imgs(folder_path, lmdb_path, img_path_list, keys)
 
+def create_lmdb_for_div2k_psf():
+    """Create LMDB files for DIV2K training and validation sets for PSF deblurring.
+
+    Only GT (clean) images are stored; degradation is applied on-the-fly.
+    LMDB output paths follow the NAFNet dataset layout.
+    """
+    # ---- Training set ----
+    folder_path = 'E:/code/NAFNet/datasets/DIV2K/DIV2K_train_HR'
+    lmdb_path = 'E:/code/NAFNet/datasets/DIV2K/DIV2K_train_HR.lmdb'
+
+    img_path_list, keys = prepare_keys(folder_path, 'png')
+    make_lmdb_from_imgs(folder_path, lmdb_path, img_path_list, keys)
+
+    # ---- Validation set ----
+    folder_path = 'E:/code/NAFNet/datasets/DIV2K/DIV2K_valid_HR'
+    lmdb_path = 'E:/code/NAFNet/datasets/DIV2K/DIV2K_valid_HR.lmdb'
+
+    img_path_list, keys = prepare_keys(folder_path, 'png')
+    make_lmdb_from_imgs(folder_path, lmdb_path, img_path_list, keys)
+
+    print('DIV2K PSF LMDB creation done: training + validation sets.')
+
+
 def create_lmdb_for_SIDD():
     folder_path = './datasets/SIDD/train/input_crops'
     lmdb_path = './datasets/SIDD/train/input_crops.lmdb'
@@ -105,7 +128,7 @@ def create_lmdb_for_SIDD():
     N, B, H ,W, C = data.shape
     data = data.reshape(N*B, H, W, C)
     for i in tqdm(range(N*B)):
-        cv2.imwrite(osp.join(folder_path, 'ValidationBlocksSrgb_{}.png'.format(i)), cv2.cvtColor(data[i,...], cv2.COLOR_RGB2BGR)) 
+        cv2.imwrite(osp.join(folder_path, 'ValidationBlocksSrgb_{}.png'.format(i)), cv2.cvtColor(data[i,...], cv2.COLOR_RGB2BGR))
     img_path_list, keys = prepare_keys(folder_path, 'png')
     make_lmdb_from_imgs(folder_path, lmdb_path, img_path_list, keys)
 
@@ -119,6 +142,6 @@ def create_lmdb_for_SIDD():
     N, B, H ,W, C = data.shape
     data = data.reshape(N*B, H, W, C)
     for i in tqdm(range(N*B)):
-        cv2.imwrite(osp.join(folder_path, 'ValidationBlocksSrgb_{}.png'.format(i)), cv2.cvtColor(data[i,...], cv2.COLOR_RGB2BGR)) 
+        cv2.imwrite(osp.join(folder_path, 'ValidationBlocksSrgb_{}.png'.format(i)), cv2.cvtColor(data[i,...], cv2.COLOR_RGB2BGR))
     img_path_list, keys = prepare_keys(folder_path, 'png')
     make_lmdb_from_imgs(folder_path, lmdb_path, img_path_list, keys)

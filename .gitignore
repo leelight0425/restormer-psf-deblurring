@@ -8,3 +8,6 @@
 *.npy
 .DS_Store
 
+experiments/
+results/
+tb_logger/

@@ -154,12 +154,13 @@ class BaseModel():
             net_cls_str = f'{net.__class__.__name__}'
 
         net = self.get_bare_model(net)
-        net_str = str(net)
         net_params = sum(map(lambda x: x.numel(), net.parameters()))
 
         logger.info(
             f'Network: {net_cls_str}, with parameters: {net_params:,d}')
-        logger.info(net_str)
+
+        if self.opt.get('train', {}).get('print_network_modules', False):
+            logger.info(str(net))
 
     def _set_lr(self, lr_groups_l):
         """Set learning rate for warmup.
@@ -211,7 +212,7 @@ class BaseModel():
         ]
 
     @master_only
-    def save_network(self, net, net_label, current_iter, param_key='params'):
+    def save_network(self, net, net_label, current_iter, param_key='params', suffix=None):
         """Save networks.
 
         Args:
@@ -220,10 +221,14 @@ class BaseModel():
             current_iter (int): Current iter number.
             param_key (str | list[str]): The parameter key(s) to save network.
                 Default: 'params'.
+            suffix (str | None): Optional suffix for filename (e.g. 'best').
         """
         if current_iter == -1:
             current_iter = 'latest'
-        save_filename = f'{net_label}_{current_iter}.pth'
+        if suffix is not None:
+            save_filename = f'{net_label}_{suffix}.pth'
+        else:
+            save_filename = f'{net_label}_{current_iter}.pth'
         save_path = os.path.join(self.opt['path']['models'], save_filename)
 
         net = net if isinstance(net, list) else [net]
@@ -299,13 +304,28 @@ class BaseModel():
                 param_key = 'params'
                 logger.info('Loading: params_ema does not exist, use params.')
             load_net = load_net[param_key]
-        print(' load net keys', load_net.keys)
         # remove unnecessary 'module.'
         for k, v in deepcopy(load_net).items():
             if k.startswith('module.'):
                 load_net[k[7:]] = v
                 load_net.pop(k)
         self._print_different_keys_loading(net, load_net, strict)
+
+        # Fix incompatible keys (e.g. inp_channels mismatch, skip_proj):
+        # strict=False also skips keys whose shapes don't match.
+        if not strict:
+            crt_net = self.get_bare_model(net)
+            crt_dict = crt_net.state_dict()
+            for k in list(load_net.keys()):
+                if k not in crt_dict:
+                    logger.warning(f'  Skip unmatched key (not in model): {k}')
+                    load_net.pop(k)
+                elif load_net[k].shape != crt_dict[k].shape:
+                    logger.warning(
+                        f'  Skip shape-mismatched key: {k} '
+                        f'(ckpt {list(load_net[k].shape)} vs model {list(crt_dict[k].shape)})')
+                    load_net.pop(k)
+
         net.load_state_dict(load_net, strict=strict)
 
     @master_only

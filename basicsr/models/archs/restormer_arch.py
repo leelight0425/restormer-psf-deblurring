@@ -95,6 +95,59 @@ class FeedForward(nn.Module):
 
 
 ##########################################################################
+## PSF Kernel Encoder
+class PSFKernelEncoder(nn.Module):
+    """Encode a 2D PSF kernel (e.g. 31x31) into a compact feature vector via CNN.
+
+    Input:  (B, 1, psf_size, psf_size)  or  (B, psf_size, psf_size)
+    Output: (B, feat_dim)
+    """
+    def __init__(self, psf_size=31, feat_dim=16):
+        super().__init__()
+        self.psf_size = psf_size
+        self.feat_dim = feat_dim
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 16, 3, stride=2, padding=1, bias=True),   # -> 16x16
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 32, 3, stride=2, padding=1, bias=True),  # -> 8x8
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1, bias=True),  # -> 4x4
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(64, feat_dim),
+        )
+
+    def forward(self, psf):
+        if psf.dim() == 3:
+            psf = psf.unsqueeze(1)  # (B, H, W) -> (B, 1, H, W)
+        return self.encoder(psf)
+
+
+def tile_psf_feature(psf_batch, psf_encoder, patch_size):
+    """Encode batch PSF kernels and tile into patch-sized feature maps.
+
+    Args:
+        psf_batch:  (B, 3, S, S)  RGB PSF kernels
+        psf_encoder: PSFKernelEncoder
+        patch_size: int, target spatial size
+
+    Returns:
+        feat_map: (B, feat_dim, patch_size, patch_size)
+    """
+    B = psf_batch.shape[0]
+    feat_dim = psf_encoder.feat_dim
+    # RGB -> grayscale approximation (luminance)
+    psf_gray = psf_batch.mean(dim=1, keepdim=True)  # (B, 1, S, S)
+    # Normalize to sum=1
+    psf_gray = psf_gray / (psf_gray.sum(dim=[2, 3], keepdim=True) + 1e-10)
+    # Encode
+    feats = psf_encoder(psf_gray)  # (B, feat_dim)
+    # Tile to patch
+    return feats[:, :, None, None].expand(-1, -1, patch_size, patch_size)
+
+
+##########################################################################
 ## Multi-DConv Head Transposed Self-Attention (MDTA)
 class Attention(nn.Module):
     def __init__(self, dim, num_heads, bias):
@@ -105,15 +158,16 @@ class Attention(nn.Module):
         self.qkv = nn.Conv2d(dim, dim*3, kernel_size=1, bias=bias)
         self.qkv_dwconv = nn.Conv2d(dim*3, dim*3, kernel_size=3, stride=1, padding=1, groups=dim*3, bias=bias)
         self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
-        
+
+
 
 
     def forward(self, x):
         b,c,h,w = x.shape
 
         qkv = self.qkv_dwconv(self.qkv(x))
-        q,k,v = qkv.chunk(3, dim=1)   
-        
+        q,k,v = qkv.chunk(3, dim=1)
+
         q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
         k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
         v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
@@ -125,7 +179,7 @@ class Attention(nn.Module):
         attn = attn.softmax(dim=-1)
 
         out = (attn @ v)
-        
+
         out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
 
         out = self.project_out(out)
@@ -191,34 +245,38 @@ class Upsample(nn.Module):
 ##########################################################################
 ##---------- Restormer -----------------------
 class Restormer(nn.Module):
-    def __init__(self, 
-        inp_channels=3, 
-        out_channels=3, 
+    def __init__(self,
+        inp_channels=3,
+        out_channels=3,
         dim = 48,
-        num_blocks = [4,6,6,8], 
+        num_blocks = [4,6,6,8],
         num_refinement_blocks = 4,
         heads = [1,2,4,8],
         ffn_expansion_factor = 2.66,
         bias = False,
         LayerNorm_type = 'WithBias',   ## Other option 'BiasFree'
-        dual_pixel_task = False        ## True for dual-pixel defocus deblurring only. Also set inp_channels=6
+        dual_pixel_task = False,        ## True for dual-pixel defocus deblurring only. Also set inp_channels=6
+        kernel_channels = 0,            ## PSF encoder feature dim (0 = disabled)
     ):
 
         super(Restormer, self).__init__()
 
-        self.patch_embed = OverlapPatchEmbed(inp_channels, dim)
+        self.kernel_channels = kernel_channels
+        total_inp = inp_channels + kernel_channels
+
+        self.patch_embed = OverlapPatchEmbed(total_inp, dim)
 
         self.encoder_level1 = nn.Sequential(*[TransformerBlock(dim=dim, num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[0])])
-        
+
         self.down1_2 = Downsample(dim) ## From Level 1 to Level 2
         self.encoder_level2 = nn.Sequential(*[TransformerBlock(dim=int(dim*2**1), num_heads=heads[1], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[1])])
-        
+
         self.down2_3 = Downsample(int(dim*2**1)) ## From Level 2 to Level 3
         self.encoder_level3 = nn.Sequential(*[TransformerBlock(dim=int(dim*2**2), num_heads=heads[2], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[2])])
 
         self.down3_4 = Downsample(int(dim*2**2)) ## From Level 3 to Level 4
         self.latent = nn.Sequential(*[TransformerBlock(dim=int(dim*2**3), num_heads=heads[3], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[3])])
-        
+
         self.up4_3 = Upsample(int(dim*2**3)) ## From Level 4 to Level 3
         self.reduce_chan_level3 = nn.Conv2d(int(dim*2**3), int(dim*2**2), kernel_size=1, bias=bias)
         self.decoder_level3 = nn.Sequential(*[TransformerBlock(dim=int(dim*2**2), num_heads=heads[2], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[2])])
@@ -227,49 +285,63 @@ class Restormer(nn.Module):
         self.up3_2 = Upsample(int(dim*2**2)) ## From Level 3 to Level 2
         self.reduce_chan_level2 = nn.Conv2d(int(dim*2**2), int(dim*2**1), kernel_size=1, bias=bias)
         self.decoder_level2 = nn.Sequential(*[TransformerBlock(dim=int(dim*2**1), num_heads=heads[1], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[1])])
-        
+
         self.up2_1 = Upsample(int(dim*2**1))  ## From Level 2 to Level 1  (NO 1x1 conv to reduce channels)
 
         self.decoder_level1 = nn.Sequential(*[TransformerBlock(dim=int(dim*2**1), num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[0])])
-        
+
         self.refinement = nn.Sequential(*[TransformerBlock(dim=int(dim*2**1), num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_refinement_blocks)])
-        
+
         #### For Dual-Pixel Defocus Deblurring Task ####
         self.dual_pixel_task = dual_pixel_task
         if self.dual_pixel_task:
             self.skip_conv = nn.Conv2d(dim, int(dim*2**1), kernel_size=1, bias=bias)
         ###########################
-            
+
         self.output = nn.Conv2d(int(dim*2**1), out_channels, kernel_size=3, stride=1, padding=1, bias=bias)
 
-    def forward(self, inp_img):
+        # Project input to match output channels for residual connection
+        # (needed when inp_channels != out_channels, e.g. XY input 5→3)
+        if inp_channels != out_channels:
+            self.skip_proj = nn.Conv2d(inp_channels, out_channels, kernel_size=1, bias=bias)
+        else:
+            self.skip_proj = None
+
+    def forward(self, inp_img, kernel_feat_map=None):
+        inp_original = inp_img  # save original for residual connection
+
+        # Concatenate PSF kernel features if present
+        if self.kernel_channels > 0:
+            assert kernel_feat_map is not None, \
+                "kernel_channels>0 requires kernel_feat_map"
+            inp_img = torch.cat([inp_img, kernel_feat_map], dim=1)
 
         inp_enc_level1 = self.patch_embed(inp_img)
         out_enc_level1 = self.encoder_level1(inp_enc_level1)
-        
+
         inp_enc_level2 = self.down1_2(out_enc_level1)
         out_enc_level2 = self.encoder_level2(inp_enc_level2)
 
         inp_enc_level3 = self.down2_3(out_enc_level2)
-        out_enc_level3 = self.encoder_level3(inp_enc_level3) 
+        out_enc_level3 = self.encoder_level3(inp_enc_level3)
 
-        inp_enc_level4 = self.down3_4(out_enc_level3)        
-        latent = self.latent(inp_enc_level4) 
-                        
+        inp_enc_level4 = self.down3_4(out_enc_level3)
+        latent = self.latent(inp_enc_level4)
+
         inp_dec_level3 = self.up4_3(latent)
         inp_dec_level3 = torch.cat([inp_dec_level3, out_enc_level3], 1)
         inp_dec_level3 = self.reduce_chan_level3(inp_dec_level3)
-        out_dec_level3 = self.decoder_level3(inp_dec_level3) 
+        out_dec_level3 = self.decoder_level3(inp_dec_level3)
 
         inp_dec_level2 = self.up3_2(out_dec_level3)
         inp_dec_level2 = torch.cat([inp_dec_level2, out_enc_level2], 1)
         inp_dec_level2 = self.reduce_chan_level2(inp_dec_level2)
-        out_dec_level2 = self.decoder_level2(inp_dec_level2) 
+        out_dec_level2 = self.decoder_level2(inp_dec_level2)
 
         inp_dec_level1 = self.up2_1(out_dec_level2)
         inp_dec_level1 = torch.cat([inp_dec_level1, out_enc_level1], 1)
         out_dec_level1 = self.decoder_level1(inp_dec_level1)
-        
+
         out_dec_level1 = self.refinement(out_dec_level1)
 
         #### For Dual-Pixel Defocus Deblurring Task ####
@@ -278,8 +350,11 @@ class Restormer(nn.Module):
             out_dec_level1 = self.output(out_dec_level1)
         ###########################
         else:
-            out_dec_level1 = self.output(out_dec_level1) + inp_img
+            out_dec_level1 = self.output(out_dec_level1)
+            if self.skip_proj is not None:
+                out_dec_level1 = out_dec_level1 + self.skip_proj(inp_original)
+            else:
+                out_dec_level1 = out_dec_level1 + inp_original
 
 
         return out_dec_level1
-

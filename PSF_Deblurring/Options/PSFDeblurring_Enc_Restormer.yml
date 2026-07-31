@@ -1,0 +1,124 @@
+# ------------------------------------------------------------------------
+# PSF Deblurring with Restormer + PSF Kernel Encoder
+#
+# The PSF encoder (PSFKernelEncoder) encodes the 31x31x3 PSF kernel
+# into a 16-dim feature map which is concatenated to the RGB input,
+# giving the network explicit knowledge of the spatially-varying blur.
+# ------------------------------------------------------------------------
+name: PSFDeblurring_Enc_Restormer
+model_type: ImageCleanModel
+scale: 1
+num_gpu: 0
+manual_seed: 42
+
+datasets:
+  train:
+    name: TrainSet
+    type: Dataset_PSFDeblurring
+    dataroot_gt: E:/code/NAFNet/datasets/DIV2K/DIV2K_train_HR
+    npz_dir: E:/code/NAFNet/npz_07131
+    use_flip: true
+    use_rot: true
+    use_xy: true               # 5ch input = RGB(3) + XY(2)
+    geometric_augs: false
+
+    io_backend:
+      type: disk
+    use_shuffle: true
+    num_worker_per_gpu: 4
+    batch_size_per_gpu: 1
+
+    ### Progressive training
+    mini_batch_sizes: [4, 2, 2, 1, 1, 1]
+    iters: [92000, 64000, 48000, 36000, 36000, 24000]
+    gt_size: 384
+    gt_sizes: [128, 160, 192, 256, 320, 384]
+
+    dataset_enlarge_ratio: 1
+    prefetch_mode: ~
+
+  val:
+    name: ValSet
+    type: Dataset_PSFDeblurring
+    dataroot_gt: E:/code/NAFNet/datasets/DIV2K/DIV2K_valid_HR
+    npz_dir: E:/code/NAFNet/npz_07131
+    use_flip: false
+    use_rot: false
+    use_xy: true
+    io_backend:
+      type: disk
+
+network_g:
+  type: Restormer
+  inp_channels: 5               # RGB(3) + XY(2)
+  out_channels: 3
+  dim: 48
+  num_blocks: [4, 6, 6, 8]
+  num_refinement_blocks: 4
+  heads: [1, 2, 4, 8]
+  ffn_expansion_factor: 2.66
+  bias: False
+  LayerNorm_type: WithBias
+  dual_pixel_task: False
+  kernel_channels: 16            # PSF encoder feature dim
+
+path:
+  # root: /mnt/Project
+  pretrain_network_g: ~
+  strict_load_g: false
+  resume_state: ~
+
+train:
+  total_iter: 300000
+  warmup_iter: -1
+  use_grad_clip: true
+  gradient_accumulation_steps: 1
+  print_network_modules: false
+  psf_encoder_lr: !!float 3e-5   # 10x smaller than main lr
+  scheduler:
+    type: CosineAnnealingRestartCyclicLR
+    periods: [92000, 208000]
+    restart_weights: [1, 1]
+    eta_mins: [0.0003, 0.000001]
+  mixing_augs:
+    mixup: false
+    mixup_beta: 1.2
+    use_identity: true
+  optim_g:
+    type: AdamW
+    lr: !!float 3e-4
+    weight_decay: !!float 1e-4
+    betas: [0.9, 0.999]
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1
+    reduction: mean
+
+val:
+  window_size: 8
+  val_freq: !!float 4e3
+  save_img: false
+  rgb2bgr: true
+  use_image: false
+  max_minibatch: 8
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 0
+      test_y_channel: false
+    ssim:
+      type: calculate_ssim
+      crop_border: 0
+      test_y_channel: false
+
+logger:
+  print_freq: 1000
+  save_checkpoint_freq: !!float 4e3
+  use_tb_logger: true
+  wandb:
+    project: ~
+    resume_id: ~
+
+dist_params:
+  backend: nccl
+  port: 29500

@@ -6,6 +6,7 @@ from os import path as osp
 from tqdm import tqdm
 
 from basicsr.models.archs import define_network
+from basicsr.models.archs.restormer_arch import PSFKernelEncoder, tile_psf_feature
 from basicsr.models.base_model import BaseModel
 from basicsr.utils import get_root_logger, imwrite, tensor2img
 
@@ -56,21 +57,44 @@ class ImageCleanModel(BaseModel):
 
         # define network
 
-        self.mixing_flag = self.opt['train']['mixing_augs'].get('mixup', False)
-        if self.mixing_flag:
-            mixup_beta       = self.opt['train']['mixing_augs'].get('mixup_beta', 1.2)
-            use_identity     = self.opt['train']['mixing_augs'].get('use_identity', False)
-            self.mixing_augmentation = Mixing_Augment(mixup_beta, use_identity, self.device)
+        self.mixing_flag = False
+        if self.is_train:
+            self.mixing_flag = self.opt['train']['mixing_augs'].get('mixup', False)
+            if self.mixing_flag:
+                mixup_beta       = self.opt['train']['mixing_augs'].get('mixup_beta', 1.2)
+                use_identity     = self.opt['train']['mixing_augs'].get('use_identity', False)
+                self.mixing_augmentation = Mixing_Augment(mixup_beta, use_identity, self.device)
 
         self.net_g = define_network(deepcopy(opt['network_g']))
         self.net_g = self.model_to_device(self.net_g)
         self.print_network(self.net_g)
+
+        # PSF encoder (if kernel_channels > 0)
+        self.kernel_channels = opt['network_g'].get('kernel_channels', 0)
+        if self.kernel_channels > 0:
+            self.psf_encoder = PSFKernelEncoder(psf_size=31, feat_dim=self.kernel_channels)
+            self.psf_encoder = self.psf_encoder.to(self.device)
+            if self.is_train:
+                self.psf_encoder.train()
+                logger = get_root_logger()
+                logger.info(f'PSF Encoder: psf_size=31 feat_dim={self.kernel_channels}')
+        else:
+            self.psf_encoder = None
 
         # load pretrained models
         load_path = self.opt['path'].get('pretrain_network_g', None)
         if load_path is not None:
             self.load_network(self.net_g, load_path,
                               self.opt['path'].get('strict_load_g', True), param_key=self.opt['path'].get('param_key', 'params'))
+
+        # load pretrained PSF encoder
+        if self.psf_encoder is not None:
+            psf_enc_path = self.opt['path'].get('pretrain_psf_encoder', None)
+            if psf_enc_path is not None:
+                logger = get_root_logger()
+                logger.info(f'Loading PSF encoder from {psf_enc_path}')
+                self.load_network(self.psf_encoder, psf_enc_path,
+                                  strict=True, param_key='params')
 
         if self.is_train:
             self.init_training_settings()
@@ -108,6 +132,15 @@ class ImageCleanModel(BaseModel):
         else:
             raise ValueError('pixel loss are None.')
 
+        # gradient accumulation
+        self.grad_accum_steps = train_opt.get('gradient_accumulation_steps', 1)
+        if self.grad_accum_steps > 1:
+            logger = get_root_logger()
+            logger.info(
+                f'Use Gradient Accumulation with {self.grad_accum_steps} steps. '
+                f'Effective batch size: '
+                f'{self.opt["datasets"]["train"].get("batch_size_per_gpu", 1) * self.grad_accum_steps}')
+
         # set up optimizers and schedulers
         self.setup_optimizers()
         self.setup_schedulers()
@@ -127,16 +160,38 @@ class ImageCleanModel(BaseModel):
         if optim_type == 'Adam':
             self.optimizer_g = torch.optim.Adam(optim_params, **train_opt['optim_g'])
         elif optim_type == 'AdamW':
-            self.optimizer_g = torch.optim.AdamW(optim_params, **train_opt['optim_g'])
+            if self.psf_encoder is not None:
+                psf_enc_lr = train_opt.get('psf_encoder_lr',
+                                          train_opt['optim_g'].get('lr', 3e-4) * 0.1)
+                self.optimizer_g = torch.optim.AdamW([
+                    {'params': optim_params},
+                    {'params': self.psf_encoder.parameters(), 'lr': psf_enc_lr},
+                ], **train_opt['optim_g'])
+                logger = get_root_logger()
+                logger.info(f'PSF encoder lr: {psf_enc_lr:.2e}')
+            else:
+                self.optimizer_g = torch.optim.AdamW(optim_params, **train_opt['optim_g'])
         else:
             raise NotImplementedError(
                 f'optimizer {optim_type} is not supperted yet.')
         self.optimizers.append(self.optimizer_g)
 
+    def _encode_psf(self, data):
+        """Encode PSF kernel into feature map. Call after self.lq is set."""
+        self.kernel_feat_map = None
+        if self.psf_encoder is not None and 'psf_kernel' in data:
+            psf_k = data['psf_kernel'].to(self.device)  # (B, H, W, C) or (B, C, H, W)
+            if psf_k.dim() == 4 and psf_k.shape[-1] == 3:
+                psf_k = psf_k.permute(0, 3, 1, 2)       # HWC -> CHW
+            _, _, H, W = self.lq.shape
+            self.kernel_feat_map = tile_psf_feature(
+                psf_k, self.psf_encoder, max(H, W))
+
     def feed_train_data(self, data):
         self.lq = data['lq'].to(self.device)
         if 'gt' in data:
             self.gt = data['gt'].to(self.device)
+        self._encode_psf(data)
 
         if self.mixing_flag:
             self.gt, self.lq = self.mixing_augmentation(self.gt, self.lq)
@@ -145,34 +200,41 @@ class ImageCleanModel(BaseModel):
         self.lq = data['lq'].to(self.device)
         if 'gt' in data:
             self.gt = data['gt'].to(self.device)
+        self._encode_psf(data)
 
     def optimize_parameters(self, current_iter):
-        self.optimizer_g.zero_grad()
-        preds = self.net_g(self.lq)
+        if self.grad_accum_steps <= 1:
+            self.optimizer_g.zero_grad()
+
+        preds = self.net_g(self.lq, kernel_feat_map=self.kernel_feat_map)
         if not isinstance(preds, list):
             preds = [preds]
 
         self.output = preds[-1]
 
         loss_dict = OrderedDict()
-        # pixel loss
+        # pixel loss (not scaled — logged at original magnitude)
         l_pix = 0.
         for pred in preds:
             l_pix += self.cri_pix(pred, self.gt)
 
         loss_dict['l_pix'] = l_pix
 
-        l_pix.backward()
-        if self.opt['train']['use_grad_clip']:
-            torch.nn.utils.clip_grad_norm_(self.net_g.parameters(), 0.01)
-        self.optimizer_g.step()
+        # Scale loss for gradient accumulation
+        (l_pix / self.grad_accum_steps).backward()
+
+        if (current_iter + 1) % self.grad_accum_steps == 0:
+            if self.opt['train']['use_grad_clip']:
+                torch.nn.utils.clip_grad_norm_(self.net_g.parameters(), 0.01)
+            self.optimizer_g.step()
+            self.optimizer_g.zero_grad()
+
+            if self.ema_decay > 0:
+                self.model_ema(decay=self.ema_decay)
 
         self.log_dict = self.reduce_loss_dict(loss_dict)
 
-        if self.ema_decay > 0:
-            self.model_ema(decay=self.ema_decay)
-
-    def pad_test(self, window_size):        
+    def pad_test(self, window_size):
         scale = self.opt.get('scale', 1)
         mod_pad_h, mod_pad_w = 0, 0
         _, _, h, w = self.lq.size()
@@ -181,24 +243,30 @@ class ImageCleanModel(BaseModel):
         if w % window_size != 0:
             mod_pad_w = window_size - w % window_size
         img = F.pad(self.lq, (0, mod_pad_w, 0, mod_pad_h), 'reflect')
+        if self.kernel_feat_map is not None:
+            kfm = F.pad(self.kernel_feat_map, (0, mod_pad_w, 0, mod_pad_h), 'reflect')
+            saved_kfm = self.kernel_feat_map
+            self.kernel_feat_map = kfm
         self.nonpad_test(img)
-        _, _, h, w = self.output.size()
         self.output = self.output[:, :, 0:h - mod_pad_h * scale, 0:w - mod_pad_w * scale]
+        if self.kernel_feat_map is not None:
+            self.kernel_feat_map = saved_kfm
 
     def nonpad_test(self, img=None):
         if img is None:
-            img = self.lq      
+            img = self.lq
+        kfm = self.kernel_feat_map
         if hasattr(self, 'net_g_ema'):
             self.net_g_ema.eval()
             with torch.no_grad():
-                pred = self.net_g_ema(img)
+                pred = self.net_g_ema(img, kernel_feat_map=kfm)
             if isinstance(pred, list):
                 pred = pred[-1]
             self.output = pred
         else:
             self.net_g.eval()
             with torch.no_grad():
-                pred = self.net_g(img)
+                pred = self.net_g(img, kernel_feat_map=kfm)
             if isinstance(pred, list):
                 pred = pred[-1]
             self.output = pred
@@ -219,7 +287,7 @@ class ImageCleanModel(BaseModel):
                 metric: 0
                 for metric in self.opt['val']['metrics'].keys()
             }
-        # pbar = tqdm(total=len(dataloader), unit='image')
+        pbar = tqdm(total=len(dataloader), unit='image')
 
         window_size = self.opt['val'].get('window_size', 0)
 
@@ -233,6 +301,12 @@ class ImageCleanModel(BaseModel):
         for idx, val_data in enumerate(dataloader):
             img_name = osp.splitext(osp.basename(val_data['lq_path'][0]))[0]
 
+            # log PSF info if available
+            psf_cx = val_data.get('psf_cx', [None])[0]
+            psf_cy = val_data.get('psf_cy', [None])[0]
+            psf_info = f'psf=({psf_cx},{psf_cy})' if psf_cx is not None else ''
+            pbar.set_description(f'{img_name}  {psf_info}')
+
             self.feed_data(val_data)
             test()
 
@@ -242,50 +316,76 @@ class ImageCleanModel(BaseModel):
                 gt_img = tensor2img([visuals['gt']], rgb2bgr=rgb2bgr)
                 del self.gt
 
+            # save LQ image (RGB channels only, discard XY if present)
+            lq_tensor = visuals['lq']
+            if lq_tensor.shape[1] > 3:
+                lq_tensor = lq_tensor[:, :3, :, :]
+            lq_img = tensor2img([lq_tensor], rgb2bgr=rgb2bgr)
+
             # tentative for out of GPU memory
             del self.lq
             del self.output
             torch.cuda.empty_cache()
 
             if save_img:
-                
+
                 if self.opt['is_train']:
-                    
+
                     save_img_path = osp.join(self.opt['path']['visualization'],
                                              img_name,
                                              f'{img_name}_{current_iter}.png')
-                    
+
                     save_gt_img_path = osp.join(self.opt['path']['visualization'],
                                              img_name,
                                              f'{img_name}_{current_iter}_gt.png')
+                    save_lq_img_path = osp.join(self.opt['path']['visualization'],
+                                             img_name,
+                                             f'{img_name}_{current_iter}_lq.png')
                 else:
-                    
+                    psf_tag = f'_psf({psf_cx},{psf_cy})' if psf_cx is not None else ''
                     save_img_path = osp.join(
-                        self.opt['path']['visualization'], dataset_name,
-                        f'{img_name}.png')
+                        self.opt['path']['visualization'], self.opt['name'],
+                        f'{img_name}{psf_tag}.png')
                     save_gt_img_path = osp.join(
-                        self.opt['path']['visualization'], dataset_name,
-                        f'{img_name}_gt.png')
-                    
+                        self.opt['path']['visualization'], self.opt['name'],
+                        f'{img_name}{psf_tag}_gt.png')
+                    save_lq_img_path = osp.join(
+                        self.opt['path']['visualization'], self.opt['name'],
+                        f'{img_name}{psf_tag}_lq.png')
+
                 imwrite(sr_img, save_img_path)
                 imwrite(gt_img, save_gt_img_path)
+                imwrite(lq_img, save_lq_img_path)
 
             if with_metrics:
                 # calculate metrics
                 opt_metric = deepcopy(self.opt['val']['metrics'])
+                img_metrics = {}
                 if use_image:
                     for name, opt_ in opt_metric.items():
                         metric_type = opt_.pop('type')
-                        self.metric_results[name] += getattr(
-                            metric_module, metric_type)(sr_img, gt_img, **opt_)
+                        val = getattr(metric_module, metric_type)(sr_img, gt_img, **opt_)
+                        self.metric_results[name] += val
+                        img_metrics[name] = val
                 else:
                     for name, opt_ in opt_metric.items():
                         metric_type = opt_.pop('type')
-                        self.metric_results[name] += getattr(
-                            metric_module, metric_type)(visuals['result'], visuals['gt'], **opt_)
+                        val = getattr(metric_module, metric_type)(visuals['result'], visuals['gt'], **opt_)
+                        self.metric_results[name] += val
+                        img_metrics[name] = val
+
+                # log per-image metrics
+                logger = get_root_logger()
+                metric_str = '  '.join(
+                    f'{k.upper()}={v:.4f}' for k, v in img_metrics.items())
+                logger.info(f'  [{img_name}] {metric_str}  {psf_info}')
+                pbar.set_postfix_str(
+                    f'PSNR={self.metric_results.get("psnr", 0)/(cnt+1):.2f}')
 
             cnt += 1
+            pbar.update(1)
 
+        pbar.close()
         current_metric = 0.
         if with_metrics:
             for metric in self.metric_results.keys():
@@ -316,12 +416,17 @@ class ImageCleanModel(BaseModel):
             out_dict['gt'] = self.gt.detach().cpu()
         return out_dict
 
-    def save(self, epoch, current_iter):
+    def save(self, epoch, current_iter, suffix=None):
         if self.ema_decay > 0:
             self.save_network([self.net_g, self.net_g_ema],
                               'net_g',
                               current_iter,
-                              param_key=['params', 'params_ema'])
+                              param_key=['params', 'params_ema'],
+                              suffix=suffix)
         else:
-            self.save_network(self.net_g, 'net_g', current_iter)
-        self.save_training_state(epoch, current_iter)
+            self.save_network(self.net_g, 'net_g', current_iter, suffix=suffix)
+        if self.psf_encoder is not None:
+            self.save_network(self.psf_encoder, 'psf_encoder', current_iter,
+                              suffix=suffix)
+        if suffix is None:
+            self.save_training_state(epoch, current_iter)
