@@ -287,7 +287,7 @@ class ImageCleanModel(BaseModel):
                 metric: 0
                 for metric in self.opt['val']['metrics'].keys()
             }
-        pbar = tqdm(total=len(dataloader), unit='image')
+        pbar = tqdm(total=len(dataloader), unit='image', desc=f'{dataset_name}')
 
         window_size = self.opt['val'].get('window_size', 0)
 
@@ -305,7 +305,6 @@ class ImageCleanModel(BaseModel):
             psf_cx = val_data.get('psf_cx', [None])[0]
             psf_cy = val_data.get('psf_cy', [None])[0]
             psf_info = f'psf=({psf_cx},{psf_cy})' if psf_cx is not None else ''
-            pbar.set_description(f'{img_name}  {psf_info}')
 
             self.feed_data(val_data)
             test()
@@ -358,29 +357,18 @@ class ImageCleanModel(BaseModel):
                 imwrite(lq_img, save_lq_img_path)
 
             if with_metrics:
-                # calculate metrics
+                # accumulate metrics
                 opt_metric = deepcopy(self.opt['val']['metrics'])
-                img_metrics = {}
                 if use_image:
                     for name, opt_ in opt_metric.items():
                         metric_type = opt_.pop('type')
                         val = getattr(metric_module, metric_type)(sr_img, gt_img, **opt_)
                         self.metric_results[name] += val
-                        img_metrics[name] = val
                 else:
                     for name, opt_ in opt_metric.items():
                         metric_type = opt_.pop('type')
                         val = getattr(metric_module, metric_type)(visuals['result'], visuals['gt'], **opt_)
                         self.metric_results[name] += val
-                        img_metrics[name] = val
-
-                # log per-image metrics
-                logger = get_root_logger()
-                metric_str = '  '.join(
-                    f'{k.upper()}={v:.4f}' for k, v in img_metrics.items())
-                logger.info(f'  [{img_name}] {metric_str}  {psf_info}')
-                pbar.set_postfix_str(
-                    f'PSNR={self.metric_results.get("psnr", 0)/(cnt+1):.2f}')
 
             cnt += 1
             pbar.update(1)
