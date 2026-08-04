@@ -34,7 +34,7 @@ network_g:
   bias: False
   LayerNorm_type: WithBias
   dual_pixel_task: False
-  kernel_channels: 16
+  kernel_channels: 0
 
 path:
   pretrain_network_g: ~

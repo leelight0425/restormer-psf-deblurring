@@ -1,12 +1,10 @@
 # ------------------------------------------------------------------------
-# PSF Deblurring with Restormer + PSF Encoder + XY coordinate channels
+# PSF Deblurring with XY coordinate channels only (no PSF encoder)
 #
 # XY channels: normalized sensor coordinates [-1, 1] concatenated to RGB
-# PSF encoder: CNN encodes 31x31x3 PSF → 16-dim feature map
-# Total input: RGB(3) + XY(2) + kernel(16) = 21 channels
+# Total input: RGB(3) + XY(2) = 5 channels
 # ------------------------------------------------------------------------
-# general settings
-name: PSFDeblurringXY_Restormer
+name: PSFDeblurringXY_NoEnc_Restormer
 model_type: ImageCleanModel
 scale: 1
 num_gpu: 4
@@ -30,7 +28,6 @@ datasets:
     num_worker_per_gpu: 4
     batch_size_per_gpu: 1
 
-    ### Progressive training
     mini_batch_sizes: [4, 2, 2, 1, 1, 1]
     iters: [92000, 64000, 48000, 36000, 36000, 24000]
     gt_size: 256
@@ -62,7 +59,7 @@ network_g:
   bias: False
   LayerNorm_type: WithBias
   dual_pixel_task: False
-  kernel_channels: 16           # PSF encoder feature dim
+  kernel_channels: 16           # PSF encoder disabled
 
 path:
   root: /mnt/Porject
@@ -76,13 +73,12 @@ train:
   use_grad_clip: true
   gradient_accumulation_steps: 1
   print_network_modules: false
-  psf_encoder_lr: !!float 3e-5   # 10x smaller than main lr
   scheduler:
     type: CosineAnnealingRestartCyclicLR
     periods: [92000, 208000]
     restart_weights: [1, 1]
     eta_mins: [0.0003, 0.000001]
-  mixing_augs:
+  mixing_augs:s
     mixup: false
     mixup_beta: 1.2
     use_identity: true
