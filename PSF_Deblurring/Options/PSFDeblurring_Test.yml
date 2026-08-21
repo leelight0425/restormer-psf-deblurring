@@ -10,7 +10,7 @@ manual_seed: 42
 
 datasets:
   test:
-    psf_edge_threshold: 500
+    psf_edge_threshold: 500  # 0 disables edge sampling
     name: DIV2K-PSF-test
     type: Dataset_PSFDeblurring
     dataroot_gt: E:/code/NAFNet/datasets/DIV2K/DIV2K_valid_HR

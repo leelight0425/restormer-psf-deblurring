@@ -181,7 +181,7 @@ class ImageCleanModel(BaseModel):
         self.kernel_feat_map = None
         if self.psf_encoder is not None and 'psf_kernel' in data:
             psf_k = data['psf_kernel'].to(self.device)  # (B, H, W, C) or (B, C, H, W)
-            if psf_k.dim() == 4 and psf_k.shape[-1] == 3:
+            if psf_k.dim() == 4 and psf_k.shape[-1] in (1, 3):
                 psf_k = psf_k.permute(0, 3, 1, 2)       # HWC -> CHW
             _, _, H, W = self.lq.shape
             self.kernel_feat_map = tile_psf_feature(

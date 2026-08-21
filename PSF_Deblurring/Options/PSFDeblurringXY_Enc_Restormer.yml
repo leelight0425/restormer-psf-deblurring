@@ -39,6 +39,7 @@ datasets:
   val:
     name: ValSet
     type: Dataset_PSFDeblurring
+    psf_edge_threshold: 500  # 0 disables edge sampling
     dataroot_gt: datasets/DIV2K/DIV2K_valid_HR
     npz_dir: npz_07131
     use_flip: false
@@ -78,7 +79,7 @@ train:
     periods: [92000, 208000]
     restart_weights: [1, 1]
     eta_mins: [0.0003, 0.000001]
-  mixing_augs:s
+  mixing_augs:
     mixup: false
     mixup_beta: 1.2
     use_identity: true

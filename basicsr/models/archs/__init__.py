@@ -18,7 +18,7 @@ _arch_modules = [
 ]
 
 
-def dynamic_instantiation(modules, cls_type, opt):
+def dynamic_instantiation(modules, cls_type, opt): 
     """Dynamically instantiate class.
 
     Args:

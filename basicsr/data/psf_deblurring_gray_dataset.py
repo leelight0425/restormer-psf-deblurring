@@ -1,8 +1,8 @@
 """PSF Deblurring dataset (grayscale) with on-the-fly degradation.
 
 Loads clean DIV2K images (from LMDB or disk), converts to grayscale,
-randomly crops patches, applies spatially-varying PSF convolution to
-create blurry LQ images.
+applies geometric augmentation before randomly cropping patches, and applies
+spatially-varying PSF convolution to create blurry LQ images.
 
 PSF kernel selection: maps the crop offset to sensor coordinates and
 selects the nearest PSF kernel by Euclidean distance.
@@ -12,6 +12,9 @@ Differences from ``Dataset_PSFDeblurring`` (RGB version):
     - PSF kernels are averaged across RGB channels → single channel.
     - Convolution operates on a single channel instead of per-channel.
     - Normalization mean/std are single-channel.
+
+Augmentation runs before degradation so the selected PSF, the XY channels,
+and the generated blur all describe the same augmented sensor position.
 """
 
 import random
@@ -19,7 +22,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from scipy.signal import convolve2d
+from scipy.ndimage import convolve
 from torch.utils import data as data
 from torchvision.transforms.functional import normalize
 
@@ -44,6 +47,7 @@ class Dataset_PSFDeblurringGray(data.Dataset):
             io_backend (dict): IO backend config.
             phase (str): 'train' or 'val'.
             mean, std (tuple): Normalization params (single-channel, optional).
+            psf_edge_threshold (int): Edge PSF threshold for validation.
     """
 
     def __init__(self, opt):
@@ -144,6 +148,41 @@ class Dataset_PSFDeblurringGray(data.Dataset):
         dists = np.sum((self.psf_centers - [sx, sy]) ** 2, axis=1)
         return int(np.argmin(dists))
 
+    def _sample_edge_crop(self, img_w, img_h):
+        """Sample a point in an edge strip, then select its nearest PSF."""
+        max_top = img_h - self.gt_size
+        max_left = img_w - self.gt_size
+        max_sensor_x = self._map_offset_to_sensor(
+            max_left, 0, img_w, img_h)[0]
+        max_sensor_y = self._map_offset_to_sensor(
+            0, max_top, img_w, img_h)[1]
+        threshold = self.psf_edge_threshold
+
+        side = random.choice(('left', 'right', 'top', 'bottom'))
+        if side == 'left':
+            sensor_x = random.uniform(0, min(threshold, max_sensor_x))
+            sensor_y = random.uniform(0, max_sensor_y)
+        elif side == 'right':
+            sensor_x = random.uniform(
+                max(0, max_sensor_x - threshold), max_sensor_x)
+            sensor_y = random.uniform(0, max_sensor_y)
+        elif side == 'top':
+            sensor_x = random.uniform(0, max_sensor_x)
+            sensor_y = random.uniform(0, min(threshold, max_sensor_y))
+        else:
+            sensor_x = random.uniform(0, max_sensor_x)
+            sensor_y = random.uniform(
+                max(0, max_sensor_y - threshold), max_sensor_y)
+
+        left = int(round(sensor_x / max(self.sensor_w - 1, 1) *
+                         max(img_w - 1, 1)))
+        top = int(round(sensor_y / max(self.sensor_h - 1, 1) *
+                        max(img_h - 1, 1)))
+        left = int(np.clip(left, 0, max_left))
+        top = int(np.clip(top, 0, max_top))
+        psf_idx = self._find_nearest_psf(left, top, img_w, img_h)
+        return top, left, psf_idx
+
     @staticmethod
     def _psf_convolve_gray(image, psf):
         """Single-channel PSF convolution.
@@ -155,12 +194,9 @@ class Dataset_PSFDeblurringGray(data.Dataset):
         Returns:
             np.ndarray: Convolved image, shape (H, W, 1), float32.
         """
-        image = image.astype(np.float64)
-        psf = psf.astype(np.float64)
-        # Squeeze to 2D for convolve2d
-        img_2d = np.squeeze(image)
-        psf_2d = np.squeeze(psf)
-        convolved = convolve2d(img_2d, psf_2d, mode='same', boundary='symm')
+        img_2d = np.ascontiguousarray(np.squeeze(image), dtype=np.float64)
+        psf_2d = np.ascontiguousarray(np.squeeze(psf), dtype=np.float64)
+        convolved = convolve(img_2d, psf_2d, mode='reflect')
         return convolved.astype(np.float32)[:, :, np.newaxis]
 
     # ------------------------------------------------------------------
@@ -174,54 +210,6 @@ class Dataset_PSFDeblurringGray(data.Dataset):
         ys_norm = ys / (self.sensor_h - 1) * 2.0 - 1.0
         xx, yy = np.meshgrid(xs_norm, ys_norm)
         return np.stack([xx, yy], axis=2)  # (H, W, 2)
-
-    # ------------------------------------------------------------------
-    # Augmentation
-    # ------------------------------------------------------------------
-
-    def _augment(self, img_gt, img_lq):
-        hflip = self.use_flip and random.random() < 0.5
-        vflip = self.use_rot and random.random() < 0.5
-        rot90 = self.use_rot and random.random() < 0.5
-
-        for img in [img_gt, img_lq]:
-            if hflip:
-                cv2.flip(img, 1, img)
-            if vflip:
-                cv2.flip(img, 0, img)
-
-        if rot90:
-            img_gt = img_gt.transpose(1, 0, 2).copy()
-            img_lq = img_lq.transpose(1, 0, 2).copy()
-
-        return img_gt, img_lq
-
-    def _augment_with_xy(self, img_gt, img_lq, xy_grid):
-        hflip = self.use_flip and random.random() < 0.5
-        vflip = self.use_rot and random.random() < 0.5
-        rot90 = self.use_rot and random.random() < 0.5
-
-        imgs = [img_gt, img_lq, xy_grid]
-        result = []
-        for img in imgs:
-            if hflip:
-                img = cv2.flip(img, 1)
-            if vflip:
-                img = cv2.flip(img, 0)
-            if rot90:
-                img = img.transpose(1, 0, 2)
-            result.append(img)
-        img_gt, img_lq, xy_grid = result
-
-        # Fix XY signs after spatial transform
-        if hflip:
-            xy_grid[:, :, 0] = -xy_grid[:, :, 0]
-        if vflip:
-            xy_grid[:, :, 1] = -xy_grid[:, :, 1]
-        if rot90:
-            xy_grid = xy_grid[:, :, [1, 0]]
-
-        return img_gt, img_lq, xy_grid
 
     # ------------------------------------------------------------------
     # Main __getitem__
@@ -263,18 +251,30 @@ class Dataset_PSFDeblurringGray(data.Dataset):
                 img_gt, 0, h_pad, 0, w_pad, cv2.BORDER_REFLECT)
             h_img, w_img = img_gt.shape[:2]
 
-        # ---- 3. Crop + select PSF ----
+        # ---- 3. Geometric augmentation BEFORE degradation ----
+        # Select the PSF and generate XY coordinates from the augmented image
+        # so they remain consistent with the blur applied to the crop.
+        if self.is_train and (self.use_flip or self.use_rot):
+            hflip = self.use_flip and random.random() < 0.5
+            vflip = self.use_rot and random.random() < 0.5
+            rot90 = self.use_rot and random.random() < 0.5
+            if hflip:
+                img_gt = img_gt[:, ::-1, :].copy()
+            if vflip:
+                img_gt = img_gt[::-1, :, :].copy()
+            if rot90:
+                img_gt = img_gt.transpose(1, 0, 2).copy()
+            h_img, w_img = img_gt.shape[:2]
+
+        # ---- 4. Crop + select PSF (in the augmented image) ----
         if self.is_train:
             top = random.randint(0, h_img - self.gt_size)
             left = random.randint(0, w_img - self.gt_size)
             psf_idx = self._find_nearest_psf(left, top, w_img, h_img)
             psf_xy_top, psf_xy_left = top, left
         elif self.psf_edge_pool is not None:
-            top = (h_img - self.gt_size) // 2
-            left = (w_img - self.gt_size) // 2
-            psf_idx = random.choice(self.psf_edge_pool)
-            # XY from the PSF's own sensor position
-            psf_xy_top = psf_xy_left = None
+            top, left, psf_idx = self._sample_edge_crop(w_img, h_img)
+            psf_xy_top, psf_xy_left = top, left
         else:
             top = (h_img - self.gt_size) // 2
             left = (w_img - self.gt_size) // 2
@@ -285,45 +285,29 @@ class Dataset_PSFDeblurringGray(data.Dataset):
 
         img_gt_crop = img_gt[top:top + self.gt_size, left:left + self.gt_size, :].copy()
 
-        # ---- 4. PSF convolution: GT → LQ (grayscale domain) ----
+        # ---- 5. PSF convolution: augmented GT -> LQ (grayscale domain) ----
         psf = self.psf_kernels[psf_idx]  # (H, W, 1)
         img_lq = self._psf_convolve_gray(img_gt_crop, psf)
         img_lq = np.clip(img_lq, 0.0, 1.0)
 
-        # ---- 5. Augmentation & XY channel handling ----
+        # ---- 6. XY channel handling ----
         if self.use_xy:
             step_x = self.sensor_w / w_img
             step_y = self.sensor_h / h_img
-
-            if self.psf_edge_pool is not None and not self.is_train:
-                # Edge PSF mode: XY from PSF's own sensor position (patch center)
-                psf_cx, psf_cy = self.psf_centers[psf_idx]
-                half_sx = (self.gt_size / 2) * step_x
-                half_sy = (self.gt_size / 2) * step_y
-                sensor_x = psf_cx - half_sx
-                sensor_y = psf_cy - half_sy
-            else:
-                sensor_x, sensor_y = self._map_offset_to_sensor(
-                    psf_xy_left, psf_xy_top, w_img, h_img)
+            sensor_x, sensor_y = self._map_offset_to_sensor(
+                psf_xy_left, psf_xy_top, w_img, h_img)
 
             xy_grid = self._make_xy_grid(self.gt_size, self.gt_size,
                                          sensor_x, sensor_y, step_x, step_y)
 
-            if self.is_train and (self.use_flip or self.use_rot):
-                img_gt_crop, img_lq, xy_grid = self._augment_with_xy(
-                    img_gt_crop, img_lq, xy_grid)
-
             # Stack LQ (1ch) + XY (2ch) → (H, W, 3)
             img_lq = np.concatenate([img_lq, xy_grid], axis=2)
-        else:
-            if self.is_train and (self.use_flip or self.use_rot):
-                img_gt_crop, img_lq = self._augment(img_gt_crop, img_lq)
 
-        # ---- 6. Convert to tensor ----
+        # ---- 7. Convert to tensor ----
         img_gt_t = img2tensor([img_gt_crop], bgr2rgb=False, float32=True)[0]
         img_lq_t = img2tensor([img_lq], bgr2rgb=False, float32=True)[0]
 
-        # ---- 7. Normalize (optional, single-channel) ----
+        # ---- 8. Normalize (optional, single-channel) ----
         if self.mean is not None and self.std is not None:
             normalize(img_lq_t, self.mean, self.std, inplace=True)
             normalize(img_gt_t, self.mean, self.std, inplace=True)
