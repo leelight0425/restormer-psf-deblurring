@@ -13,8 +13,7 @@ Examples:
     python inference_psf.py \
         --opt PSF_Deblurring/Options/PSFDeblurring_Enc_Test.yml \
         --input photo.jpg --output restored.png \
-        --model net_g_best.pth --psf_dir npz_07131 \
-        --psf_encoder psf_encoder_best.pth
+        --model net_g_best.pth --psf_dir npz_07131
 """
 
 import argparse
@@ -32,8 +31,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from basicsr.models.archs import define_network
-from basicsr.models.archs.restormer_arch import (PSFKernelEncoder,
-                                                  tile_psf_feature)
 from basicsr.utils.options import parse
 
 
@@ -91,39 +88,6 @@ def _find_model_checkpoint(opt):
         checkpoints = list(model_dir.glob('net_g_*.pth'))
         if checkpoints:
             return max(checkpoints, key=_checkpoint_sort_key)
-
-    return None
-
-
-def _find_psf_encoder_checkpoint(opt, model_path):
-    configured = _as_existing_file(
-        opt.get('path', {}).get('pretrain_psf_encoder'))
-    if configured is not None:
-        return configured
-
-    model_dirs = [model_path.parent]
-    configured_root = opt.get('path', {}).get('root')
-    if configured_root:
-        model_dirs.append(Path(configured_root) / 'experiments' /
-                          opt['name'] / 'models')
-    model_dirs.append(ROOT / 'experiments' / opt['name'] / 'models')
-
-    suffix = model_path.stem[len('net_g_'):] \
-        if model_path.stem.startswith('net_g_') else None
-    filenames = []
-    if suffix:
-        filenames.append(f'psf_encoder_{suffix}.pth')
-    filenames.extend(['psf_encoder_best.pth', 'psf_encoder_latest.pth'])
-
-    seen = set()
-    for model_dir in model_dirs:
-        if str(model_dir) in seen or not model_dir.is_dir():
-            continue
-        seen.add(str(model_dir))
-        for filename in filenames:
-            candidate = model_dir / filename
-            if candidate.is_file():
-                return candidate
 
     return None
 
@@ -267,8 +231,8 @@ def _pad_to_multiple(image, multiple=MODEL_INPUT_MULTIPLE):
     return np.pad(image, pad_width, mode='reflect')
 
 
-def _process_tile(net, psf_encoder, tile, top, left, img_h, img_w,
-                  device, mode, psf_entry, sensor_w, sensor_h):
+def _process_tile(net, tile, top, left, img_h, img_w, device, mode,
+                  psf_entry, sensor_w, sensor_h):
     tile_h, tile_w = tile.shape[:2]
     tile = _pad_to_multiple(tile)
     padded_h, padded_w = tile.shape[:2]
@@ -285,19 +249,14 @@ def _process_tile(net, psf_encoder, tile, top, left, img_h, img_w,
     lq = np.ascontiguousarray(lq.transpose(2, 0, 1))
     lq_t = torch.from_numpy(lq).unsqueeze(0).to(device)
 
-    kernel_feat_map = None
-    if psf_encoder is not None:
-        if psf_entry is None:
-            raise ValueError('A PSF is required when kernel_channels > 0.')
+    kernel = None
+    if psf_entry is not None:
         psf = psf_entry['psf'].transpose(2, 0, 1)
-        psf_t = torch.from_numpy(np.ascontiguousarray(psf)).float()
-        psf_t = psf_t.unsqueeze(0).to(device)
-        kernel_feat_map = tile_psf_feature(
-            psf_t, psf_encoder, max(padded_h, padded_w))
-        kernel_feat_map = kernel_feat_map[:, :, :padded_h, :padded_w]
+        kernel = torch.from_numpy(np.ascontiguousarray(psf)).float()
+        kernel = kernel.unsqueeze(0).to(device)
 
     with torch.no_grad():
-        prediction = net(lq_t, kernel_feat_map=kernel_feat_map)
+        prediction = net(lq_t, kernel=kernel)
     if isinstance(prediction, (list, tuple)):
         prediction = prediction[-1]
 
@@ -317,9 +276,9 @@ def _tile_starts(length, tile_size, stride):
     return starts
 
 
-def inference_full(net, psf_encoder, image, device, mode, tile_size,
-                   tile_overlap, psf_entry=None, psf_bank=None,
-                   sensor_w=SENSOR_W, sensor_h=SENSOR_H):
+def inference_full(net, image, device, mode, tile_size, tile_overlap,
+                   psf_entry=None, psf_bank=None, sensor_w=SENSOR_W,
+                   sensor_h=SENSOR_H):
     """Infer an image using overlapping tiles and global sensor coordinates."""
     if tile_size <= 0:
         raise ValueError('tile_size must be greater than zero.')
@@ -341,7 +300,7 @@ def inference_full(net, psf_encoder, image, device, mode, tile_size,
                 entry = _select_psf(
                     psf_bank, top, left, img_h, img_w, sensor_w, sensor_h)
             prediction = _process_tile(
-                net, psf_encoder, tile, top, left, img_h, img_w, device,
+                net, tile, top, left, img_h, img_w, device,
                 mode, entry, sensor_w, sensor_h)
             tile_h, tile_w = tile.shape[:2]
             result[top:top + tile_h, left:left + tile_w] += prediction
@@ -360,9 +319,6 @@ def main():
         '--model', default=None,
         help='net_g checkpoint; defaults to the configured or latest '
              'checkpoint')
-    parser.add_argument(
-        '--psf_encoder', default=None,
-        help='PSF encoder checkpoint; auto-resolved when required')
     parser.add_argument('--psf', default=None, help='One fixed PSF .npz file')
     parser.add_argument(
         '--psf_dir', default=None,
@@ -415,26 +371,6 @@ def main():
     print(f'Model loaded: {model_path}')
 
     kernel_channels = int(network_opt.get('kernel_channels', 0))
-    psf_encoder = None
-    if kernel_channels > 0:
-        if args.psf_encoder:
-            encoder_path = _as_existing_file(args.psf_encoder)
-            if encoder_path is None:
-                parser.error(
-                    'PSF encoder checkpoint does not exist: '
-                    f'{args.psf_encoder}')
-        else:
-            encoder_path = _find_psf_encoder_checkpoint(opt, model_path)
-        if encoder_path is None:
-            parser.error(
-                'kernel_channels > 0 requires --psf_encoder or a matching '
-                'psf_encoder checkpoint.')
-        psf_encoder = PSFKernelEncoder(
-            psf_size=31, feat_dim=kernel_channels).to(device)
-        _load_weights(
-            psf_encoder, encoder_path, device, args.param_key, strict)
-        psf_encoder.eval()
-        print(f'PSF encoder loaded: {encoder_path}')
 
     dataset_opt = _dataset_options(opt)
     sensor_w = args.sensor_width or int(
@@ -473,7 +409,7 @@ def main():
         f'tile={tile_size} overlap={tile_overlap} | device={device}')
 
     result = inference_full(
-        net, psf_encoder, image, device, mode, tile_size, tile_overlap,
+        net, image, device, mode, tile_size, tile_overlap,
         psf_entry=fixed_psf, psf_bank=psf_bank,
         sensor_w=sensor_w, sensor_h=sensor_h)
 

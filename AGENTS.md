@@ -23,6 +23,7 @@
 ## PSF Invariants
 
 - `Dataset_PSFDeblurring` and `Dataset_PSFDeblurringGray` expect `.npz` files containing `psf`, `cx`, and `cy`, support disk or LMDB GT input, and return `psf_kernel` in HWC form for the Restormer PSF encoder.
+- When `kernel_channels > 0`, Restormer's PSF encoder is a submodule of `net_g`; its weights are saved in the same `net_g_<iter>.pth` checkpoint, as in NAFNet.
 - Training flips and rotations must be applied to the full GT image before crop selection, PSF selection, convolution, and XY generation; changing this order makes the blur and sensor coordinates inconsistent.
 - Validation edge sampling is controlled by `psf_edge_threshold` (the PSF YAMLs use `500`; `0` disables it); a random point in an edge strip is sampled first and `_find_nearest_psf` selects its kernel instead of using a fixed image-center crop.
 - Keep `use_xy` consistent with `network_g.inp_channels` (`3` for RGB or `5` for RGB plus XY), and keep `kernel_channels > 0` paired with the `psf_kernel` data path.

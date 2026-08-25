@@ -1,0 +1,69 @@
+# ------------------------------------------------------------------------
+# Test config for PSF Deblurring Encoder (kernel_channels=16)
+# Usage: python basicsr/test.py -opt PSF_Deblurring/Options/PSFDeblurring_Enc_Test.yml
+# ------------------------------------------------------------------------
+name: PSFDeblurring_Enc_Test-Gray
+model_type: ImageCleanModel
+scale: 1
+num_gpu: 0 #number
+manual_seed: 42
+
+datasets:
+  test:
+    psf_edge_threshold: 500  # 0 disables edge sampling
+    name: DIV2K-PSF-test
+    type: Dataset_PSFDeblurringGray #type
+    dataroot_gt: E:/code/NAFNet/datasets/DIV2K/DIV2K_valid_HR  
+    npz_dir: E:/code/NAFNet/npz_07131
+    use_flip: false
+    use_rot: false
+    use_xy: false               # must match training: 5ch RGB+XY
+    gt_size: 256
+    io_backend:
+      type: disk
+
+network_g:
+  type: Restormer
+  inp_channels: 1               # RGB(3) + XY(2)
+  out_channels: 1
+  dim: 48
+  num_blocks: [4, 6, 6, 8]
+  num_refinement_blocks: 4
+  heads: [1, 2, 4, 8]
+  ffn_expansion_factor: 2.66
+  bias: False
+  LayerNorm_type: WithBias
+  dual_pixel_task: False
+  kernel_channels: 16  #channels
+
+path:
+  pretrain_network_g: E:\model\PSFDeblurring_Enc_Restormer\models\net_g_best.pth
+  strict_load_g: false
+  resume_state: ~
+
+val:
+  window_size: 8
+  save_img: true
+  rgb2bgr: true
+  use_image: true
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 0
+      test_y_channel: false
+    ssim:
+      type: calculate_ssim
+      crop_border: 0
+      test_y_channel: false
+
+logger:
+  print_freq: 1
+  save_checkpoint_freq: ~
+  use_tb_logger: false
+  wandb:
+    project: ~
+    resume_id: ~
+
+dist_params:
+  backend: nccl
+  port: 29500

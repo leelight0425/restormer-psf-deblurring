@@ -6,7 +6,6 @@ from os import path as osp
 from tqdm import tqdm
 
 from basicsr.models.archs import define_network
-from basicsr.models.archs.restormer_arch import PSFKernelEncoder, tile_psf_feature
 from basicsr.models.base_model import BaseModel
 from basicsr.utils import get_root_logger, imwrite, tensor2img
 
@@ -69,17 +68,8 @@ class ImageCleanModel(BaseModel):
         self.net_g = self.model_to_device(self.net_g)
         self.print_network(self.net_g)
 
-        # PSF encoder (if kernel_channels > 0)
+        # The PSF encoder is owned by net_g, following the NAFNet design.
         self.kernel_channels = opt['network_g'].get('kernel_channels', 0)
-        if self.kernel_channels > 0:
-            self.psf_encoder = PSFKernelEncoder(psf_size=31, feat_dim=self.kernel_channels)
-            self.psf_encoder = self.psf_encoder.to(self.device)
-            if self.is_train:
-                self.psf_encoder.train()
-                logger = get_root_logger()
-                logger.info(f'PSF Encoder: psf_size=31 feat_dim={self.kernel_channels}')
-        else:
-            self.psf_encoder = None
 
         # load pretrained models
         load_path = self.opt['path'].get('pretrain_network_g', None)
@@ -87,13 +77,15 @@ class ImageCleanModel(BaseModel):
             self.load_network(self.net_g, load_path,
                               self.opt['path'].get('strict_load_g', True), param_key=self.opt['path'].get('param_key', 'params'))
 
-        # load pretrained PSF encoder
-        if self.psf_encoder is not None:
+        # Load a legacy standalone PSF encoder, if explicitly configured.
+        # New checkpoints include this module inside net_g.
+        if self.kernel_channels > 0:
             psf_enc_path = self.opt['path'].get('pretrain_psf_encoder', None)
             if psf_enc_path is not None:
                 logger = get_root_logger()
                 logger.info(f'Loading PSF encoder from {psf_enc_path}')
-                self.load_network(self.psf_encoder, psf_enc_path,
+                net_g = self.get_bare_model(self.net_g)
+                self.load_network(net_g.psf_encoder, psf_enc_path,
                                   strict=True, param_key='params')
 
         if self.is_train:
@@ -160,38 +152,26 @@ class ImageCleanModel(BaseModel):
         if optim_type == 'Adam':
             self.optimizer_g = torch.optim.Adam(optim_params, **train_opt['optim_g'])
         elif optim_type == 'AdamW':
-            if self.psf_encoder is not None:
-                psf_enc_lr = train_opt.get('psf_encoder_lr',
-                                          train_opt['optim_g'].get('lr', 3e-4) * 0.1)
-                self.optimizer_g = torch.optim.AdamW([
-                    {'params': optim_params},
-                    {'params': self.psf_encoder.parameters(), 'lr': psf_enc_lr},
-                ], **train_opt['optim_g'])
-                logger = get_root_logger()
-                logger.info(f'PSF encoder lr: {psf_enc_lr:.2e}')
-            else:
-                self.optimizer_g = torch.optim.AdamW(optim_params, **train_opt['optim_g'])
+            self.optimizer_g = torch.optim.AdamW(optim_params, **train_opt['optim_g'])
         else:
             raise NotImplementedError(
                 f'optimizer {optim_type} is not supperted yet.')
         self.optimizers.append(self.optimizer_g)
 
-    def _encode_psf(self, data):
-        """Encode PSF kernel into feature map. Call after self.lq is set."""
-        self.kernel_feat_map = None
-        if self.psf_encoder is not None and 'psf_kernel' in data:
+    def _prepare_psf_kernel(self, data):
+        """Prepare the PSF tensor for the encoder inside net_g."""
+        self.kernel = None
+        if self.kernel_channels > 0 and 'psf_kernel' in data:
             psf_k = data['psf_kernel'].to(self.device)  # (B, H, W, C) or (B, C, H, W)
             if psf_k.dim() == 4 and psf_k.shape[-1] in (1, 3):
                 psf_k = psf_k.permute(0, 3, 1, 2)       # HWC -> CHW
-            _, _, H, W = self.lq.shape
-            self.kernel_feat_map = tile_psf_feature(
-                psf_k, self.psf_encoder, max(H, W))
+            self.kernel = psf_k
 
     def feed_train_data(self, data):
         self.lq = data['lq'].to(self.device)
         if 'gt' in data:
             self.gt = data['gt'].to(self.device)
-        self._encode_psf(data)
+        self._prepare_psf_kernel(data)
 
         if self.mixing_flag:
             self.gt, self.lq = self.mixing_augmentation(self.gt, self.lq)
@@ -200,13 +180,13 @@ class ImageCleanModel(BaseModel):
         self.lq = data['lq'].to(self.device)
         if 'gt' in data:
             self.gt = data['gt'].to(self.device)
-        self._encode_psf(data)
+        self._prepare_psf_kernel(data)
 
     def optimize_parameters(self, current_iter):
         if self.grad_accum_steps <= 1:
             self.optimizer_g.zero_grad()
 
-        preds = self.net_g(self.lq, kernel_feat_map=self.kernel_feat_map)
+        preds = self.net_g(self.lq, kernel=self.kernel)
         if not isinstance(preds, list):
             preds = [preds]
 
@@ -243,30 +223,24 @@ class ImageCleanModel(BaseModel):
         if w % window_size != 0:
             mod_pad_w = window_size - w % window_size
         img = F.pad(self.lq, (0, mod_pad_w, 0, mod_pad_h), 'reflect')
-        if self.kernel_feat_map is not None:
-            kfm = F.pad(self.kernel_feat_map, (0, mod_pad_w, 0, mod_pad_h), 'reflect')
-            saved_kfm = self.kernel_feat_map
-            self.kernel_feat_map = kfm
         self.nonpad_test(img)
         self.output = self.output[:, :, 0:h - mod_pad_h * scale, 0:w - mod_pad_w * scale]
-        if self.kernel_feat_map is not None:
-            self.kernel_feat_map = saved_kfm
 
     def nonpad_test(self, img=None):
         if img is None:
             img = self.lq
-        kfm = self.kernel_feat_map
+        kernel = self.kernel
         if hasattr(self, 'net_g_ema'):
             self.net_g_ema.eval()
             with torch.no_grad():
-                pred = self.net_g_ema(img, kernel_feat_map=kfm)
+                pred = self.net_g_ema(img, kernel=kernel)
             if isinstance(pred, list):
                 pred = pred[-1]
             self.output = pred
         else:
             self.net_g.eval()
             with torch.no_grad():
-                pred = self.net_g(img, kernel_feat_map=kfm)
+                pred = self.net_g(img, kernel=kernel)
             if isinstance(pred, list):
                 pred = pred[-1]
             self.output = pred
@@ -315,9 +289,13 @@ class ImageCleanModel(BaseModel):
                 gt_img = tensor2img([visuals['gt']], rgb2bgr=rgb2bgr)
                 del self.gt
 
-            # save LQ image (RGB channels only, discard XY if present)
+            # Save only the image channels. Gray+XY has three channels, but
+            # its last two channels are coordinates rather than RGB.
             lq_tensor = visuals['lq']
-            if lq_tensor.shape[1] > 3:
+            is_gray = visuals['result'].shape[1] == 1
+            if is_gray:
+                lq_tensor = lq_tensor[:, :1, :, :]
+            elif lq_tensor.shape[1] > 3:
                 lq_tensor = lq_tensor[:, :3, :, :]
             lq_img = tensor2img([lq_tensor], rgb2bgr=rgb2bgr)
 
@@ -413,8 +391,5 @@ class ImageCleanModel(BaseModel):
                               suffix=suffix)
         else:
             self.save_network(self.net_g, 'net_g', current_iter, suffix=suffix)
-        if self.psf_encoder is not None:
-            self.save_network(self.psf_encoder, 'psf_encoder', current_iter,
-                              suffix=suffix)
         if suffix is None:
             self.save_training_state(epoch, current_iter)

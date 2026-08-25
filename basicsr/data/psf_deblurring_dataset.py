@@ -262,7 +262,7 @@ class Dataset_PSFDeblurring(data.Dataset):
             left = (w_img - self.gt_size) // 2
             rand_top = random.randint(0, h_img - self.gt_size)
             rand_left = random.randint(0, w_img - self.gt_size)
-            psf_idx = self._find_nearest_psf(rand_lef   t, rand_top, w_img, h_img)
+            psf_idx = self._find_nearest_psf(rand_left, rand_top, w_img, h_img)
             psf_xy_top, psf_xy_left = rand_top, rand_left
 
         img_gt_crop = img_gt[top:top + self.gt_size, left:left + self.gt_size, :].copy()

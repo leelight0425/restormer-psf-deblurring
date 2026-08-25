@@ -1,56 +1,57 @@
 # ------------------------------------------------------------------------
-# PSF Deblurring with Restormer + PSF Encoder (3-channel RGB, no XY)
+# PSF Deblurring with XY coordinate channels only (no PSF encoder)
 #
-# PSF encoder: CNN encodes 31x31x3 PSF → 16-dim feature map
-# Total input: RGB(3) + kernel(16) = 19 channels
+# XY channels: normalized sensor coordinates [-1, 1] concatenated to RGB
+# Total input: RGB(3) + XY(2) = 5 channels
 # ------------------------------------------------------------------------
-name: PSFDeblurring_Restormer
+name: PSFDeblurringXY_Restormer_Gray
 model_type: ImageCleanModel
 scale: 1
-num_gpu: 1
-manual_seed: 100
+num_gpu: 4
+manual_seed: 42
 
 datasets:
   train:
     name: TrainSet
-    type: Dataset_PSFDeblurring
-    dataroot_gt: E:/code/NAFNet/datasets/DIV2K/DIV2K_train_HR.lmdb
-    npz_dir: E:/code/NAFNet/npz_07131
+    type: Dataset_PSFDeblurringGray #type
+    dataroot_gt: /mnt/Porject/datasets/DIV2K/DIV2K_train_HR
+    npz_dir: /mnt/Porject/npz_07131
     use_flip: true
     use_rot: true
+    use_xy: true               # 5ch input = RGB(3) + XY(2)
     geometric_augs: false
 
     io_backend:
-      type: lmdb
+      type: disk
 
     use_shuffle: true
     num_worker_per_gpu: 4
-    batch_size_per_gpu: 4
+    batch_size_per_gpu: 1
 
-    ### Progressive training
     mini_batch_sizes: [4, 2, 2, 1, 1, 1]
     iters: [92000, 64000, 48000, 36000, 36000, 24000]
-    gt_size: 384
-    gt_sizes: [128, 160, 192, 256, 320, 384]
+    gt_size: 256
+    gt_sizes: [128, 160, 192, 256, 256, 256]
 
     dataset_enlarge_ratio: 1
     prefetch_mode: ~
 
   val:
     name: ValSet
-    type: Dataset_PSFDeblurring
+    type: Dataset_PSFDeblurring #type
     psf_edge_threshold: 500  # 0 disables edge sampling
-    dataroot_gt: E:/code/NAFNet/datasets/DIV2K/DIV2K_valid_HR.lmdb
-    npz_dir: E:/code/NAFNet/npz_07131
+    dataroot_gt: /mnt/Porject/datasets/DIV2K/DIV2K_valid_HR
+    npz_dir: /mnt/Porject/npz_07131
     use_flip: false
     use_rot: false
+    use_xy: true
     io_backend:
-      type: lmdb
+      type: disk
 
 network_g:
   type: Restormer
-  inp_channels: 3
-  out_channels: 3
+  inp_channels: 3               # gray(1) + XY(2)
+  out_channels: 1
   dim: 48
   num_blocks: [4, 6, 6, 8]
   num_refinement_blocks: 4
@@ -59,10 +60,10 @@ network_g:
   bias: False
   LayerNorm_type: WithBias
   dual_pixel_task: False
-  kernel_channels: 16
+  kernel_channels: 0           # PSF encoder feature dim, saved in net_g
 
 path:
-  root: /mnt/Project
+  root: /mnt/Porject
   pretrain_network_g: ~
   strict_load_g: false
   resume_state: ~
@@ -73,7 +74,6 @@ train:
   use_grad_clip: true
   gradient_accumulation_steps: 1
   print_network_modules: false
-  psf_encoder_lr: !!float 3e-5
   scheduler:
     type: CosineAnnealingRestartCyclicLR
     periods: [92000, 208000]

@@ -143,8 +143,11 @@ def tile_psf_feature(psf_batch, psf_encoder, patch_size):
     psf_gray = psf_gray / (psf_gray.sum(dim=[2, 3], keepdim=True) + 1e-10)
     # Encode
     feats = psf_encoder(psf_gray)  # (B, feat_dim)
-    # Tile to patch
-    return feats[:, :, None, None].expand(-1, -1, patch_size, patch_size)
+    if isinstance(patch_size, int):
+        patch_h, patch_w = patch_size, patch_size
+    else:
+        patch_h, patch_w = patch_size
+    return feats[:, :, None, None].expand(-1, -1, patch_h, patch_w)
 
 
 ##########################################################################
@@ -262,6 +265,11 @@ class Restormer(nn.Module):
         super(Restormer, self).__init__()
 
         self.kernel_channels = kernel_channels
+        if kernel_channels > 0:
+            # Keep the encoder inside Restormer so its weights are part of
+            # the same state_dict and checkpoint as the main network.
+            self.psf_encoder = PSFKernelEncoder(
+                psf_size=31, feat_dim=kernel_channels)
         total_inp = inp_channels + kernel_channels
 
         self.patch_embed = OverlapPatchEmbed(total_inp, dim)
@@ -307,13 +315,24 @@ class Restormer(nn.Module):
         else:
             self.skip_proj = None
 
-    def forward(self, inp_img, kernel_feat_map=None):
+    def forward(self, inp_img, kernel=None, kernel_feat_map=None):
         inp_original = inp_img  # save original for residual connection
 
-        # Concatenate PSF kernel features if present
+        # Encode the PSF inside the network, following the NAFNet design.
         if self.kernel_channels > 0:
+            if kernel is not None:
+                if kernel.dim() == 3:
+                    kernel = kernel.unsqueeze(0)
+                if kernel.shape[0] == 1 and inp_img.shape[0] != 1:
+                    kernel = kernel.expand(inp_img.shape[0], -1, -1, -1)
+                if kernel.shape[0] != inp_img.shape[0]:
+                    raise ValueError(
+                        'PSF kernel batch size must match image batch size.')
+                kernel_feat_map = tile_psf_feature(
+                    kernel, self.psf_encoder,
+                    (inp_img.shape[-2], inp_img.shape[-1]))
             assert kernel_feat_map is not None, \
-                "kernel_channels>0 requires kernel_feat_map"
+                "kernel_channels>0 requires kernel"
             inp_img = torch.cat([inp_img, kernel_feat_map], dim=1)
 
         inp_enc_level1 = self.patch_embed(inp_img)
